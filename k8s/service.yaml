@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: secure-notes
+  namespace: secure-notes
+spec:
+  type: ClusterIP
+  selector:
+    app: secure-notes
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

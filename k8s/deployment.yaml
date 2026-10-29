@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secure-notes
+  namespace: secure-notes
+  labels:
+    app: secure-notes
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: secure-notes
+  template:
+    metadata:
+      labels:
+        app: secure-notes
+    spec:
+      automountServiceAccountToken: false   # the app never talks to the Kubernetes API
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: app
+          image: ghcr.io/arxan99/devsecops-pipeline:latest  # pin to a commit SHA tag in real deployments
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: DB_PATH
+              value: /data/notes.db
+            - name: API_KEY_HASHES
+              valueFrom:
+                secretKeyRef:
+                  name: secure-notes-api-keys
+                  key: API_KEY_HASHES
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: secure-notes
+  labels:
+    # Enforce the Kubernetes "restricted" Pod Security Standard for everything in this namespace.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted

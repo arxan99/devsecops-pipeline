@@ -1,0 +1,7 @@
+line-length = 130
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "S"]
+
+[lint.per-file-ignores]
+"tests/*" = ["S101", "S105", "S106"]

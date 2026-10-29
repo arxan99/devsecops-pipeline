@@ -1,0 +1,136 @@
+name: devsecops-pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  # 1. Code quality and unit tests
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check .
+      - name: Unit and security tests (fail under 85% coverage)
+        run: pytest -q --cov=app --cov-report=term-missing --cov-fail-under=85
+
+  # 2. Static application security testing
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install bandit==1.8.0
+      - name: Bandit (fail on medium+ severity)
+        run: bandit -r app -ll
+
+  # 3. Leaked secrets in the repository history
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 4. Known vulnerabilities in third-party dependencies
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pip-audit==2.7.3
+      - name: pip-audit
+        run: pip-audit -r requirements.txt
+
+  # 5. Infrastructure-as-code checks (Terraform, Kubernetes, Dockerfile)
+  iac:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform format and validate
+        working-directory: terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false
+          terraform validate
+      - name: Validate Kubernetes manifests against the API schema
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
+          ./kubeconform -strict -summary k8s/
+      - name: Checkov misconfiguration scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: terraform,kubernetes,dockerfile
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+          soft_fail: true   # findings are reported to the Security tab; see README
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('checkov.sarif') != ''
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+
+  # 6. Build the image, scan it, generate an SBOM; publish only from main
+  build:
+    needs: [test, sast, secrets, dependencies, iac]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t "$IMAGE:${{ github.sha }}" .
+      - name: Smoke test the container
+        run: |
+          docker run -d --name app -p 8000:8000 "$IMAGE:${{ github.sha }}"
+          for i in $(seq 1 20); do curl -fs http://localhost:8000/healthz && break; sleep 1; done
+          curl -fsI http://localhost:8000/healthz | grep -i "x-content-type-options: nosniff"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/api/v1/notes)" = "401"
+          docker rm -f app
+      - name: Trivy image scan (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}:${{ github.sha }}
+          format: spdx-json
+          artifact-name: sbom.spdx.json
+      - name: Push to GitHub Container Registry
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag "$IMAGE:${{ github.sha }}" "$IMAGE:latest"
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"
